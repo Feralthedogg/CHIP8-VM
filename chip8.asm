@@ -16,6 +16,7 @@
     #   - Timer-based CPU stepping at ~60 Hz
     #   - Dirty-flag based rendering (only repaint when display changes)
     #   - Fx0A "wait for key" semantics using a non-blocking, event-driven scheme
+    #   - Sound: OFF_SOUND > 0 → CDP1802-based beep (pre-rendered 1s WAV)
     # =========================================================================
 
     .section .bss
@@ -51,7 +52,14 @@ chip8_state:
 
     .globl chip8_rng_state
 chip8_rng_state:
-    .long 0                                 # Simple LCG RNG state
+    .long 0                                 # Simple LCG RNG state (zero init)
+
+    # Whether sound(PlaySound) is currently playing on the Windows side.
+    # 0 = Not playing.
+    # 1 = Playing.
+    .globl chip8_sound_on_flag
+chip8_sound_on_flag:
+    .byte 0
 
     # -------------------------------------------------------------------------
     # Win32 globals
@@ -140,6 +148,33 @@ className:
 windowTitle:
     .string "CHIP-8 VM"
 
+    # ---------------------------------------------------------------------
+    # WAV header for 1-second, 8 kHz, 8-bit mono PCM.
+    # PCM data (8000 bytes) is generated at runtime using CDP1802 audio core
+    # and stored immediately after this header.
+    # ---------------------------------------------------------------------
+
+    .section .data
+    .align 4
+chip8_beep_wav:
+    .ascii "RIFF"
+    .long 8036                # ChunkSize = 36 + Subchunk2Size (8000)
+    .ascii "WAVE"
+    .ascii "fmt "
+    .long 16                  # Subchunk1Size (PCM)
+    .word 1                   # AudioFormat = 1 (PCM)
+    .word 1                   # NumChannels = 1
+    .long 8000                # SampleRate = 8000 Hz
+    .long 8000                # ByteRate = SampleRate * Channels * Bits/8
+    .word 1                   # BlockAlign = Channels * Bits/8
+    .word 8                   # BitsPerSample = 8
+    .ascii "data"
+    .long 8000                # Subchunk2Size = 8000 bytes (1 second)
+
+# 8000 bytes of PCM data will be filled at runtime from cdp1802_audio_sample
+chip8_beep_pcm:
+    .space 8000
+
     .section .text
     .globl chip8_init
     .globl chip8_tick_timers
@@ -149,12 +184,14 @@ windowTitle:
     .globl WndProc
     .globl load_rom
     .globl main
+    .globl chip8_build_beep_pcm
+    .globl chip8_start_beep
+    .globl chip8_stop_beep
 
     # -------------------------------------------------------------------------
     # External C / Win32 APIs
     # -------------------------------------------------------------------------
     .extern printf
-    .extern Sleep
 
     .extern GetModuleHandleA
     .extern RegisterClassExA
@@ -179,6 +216,19 @@ windowTitle:
     .extern GetMessageA
     .extern SetTimer
     .extern KillTimer
+
+    .extern PlaySoundA
+
+    # -------------------------------------------------------------------------
+    # External CDP1802 core / audio (from cdp1802.asm)
+    # -------------------------------------------------------------------------
+    .extern cdp1802_init
+    .extern cdp1802_load
+    .extern cdp1802_audio_sample
+    .extern cdp1802_beep_rom
+
+    # size of the beep ROM in bytes (REQ / LBR / SEQ / LBR)
+    .equ CDP1802_BEEP_ROM_SIZE, 8
 
     # -------------------------------------------------------------------------
     # Win32 constants
@@ -222,8 +272,16 @@ windowTitle:
     .equ TIMER_ID_STEP,      1      # Timer ID used for CPU stepping
     .equ TIMER_INTERVAL_MS, 16      # ~60 Hz (1000 / 16 ≈ 62.5)
 
+    # PlaySound Flags
+    .equ SND_SYNC,          0x0000
+    .equ SND_ASYNC,         0x0001
+    .equ SND_NODEFAULT,     0x0002
+    .equ SND_MEMORY,        0x0004
+    .equ SND_LOOP,          0x0008
+    .equ SND_NOSTOP,        0x0010
+    .equ SND_ALIAS,         0x00010000
 
-# ============================================================================
+# ============================================================================  
 # CHIP-8 CORE
 # ============================================================================
 
@@ -235,6 +293,7 @@ windowTitle:
 #   - Sets PC to 0x200
 #   - Copies built-in font into memory at 0x050
 #   - Seeds the pseudo-RNG
+#   - Builds 1-second CDP1802-based beep PCM into chip8_beep_pcm
 # ----------------------------------------------------------------------------
 chip8_init:
     pushq %rbp
@@ -270,6 +329,9 @@ chip8_init:
     # Initialize RNG seed to 1
     movl  $1, chip8_rng_state(%rip)
 
+    # Build beep PCM (1s @ 8kHz) via CDP1802 audio core
+    call  chip8_build_beep_pcm
+
     popq  %rdi
     popq  %rsi
     popq  %rbx
@@ -278,18 +340,72 @@ chip8_init:
 
 
 # ----------------------------------------------------------------------------
+# chip8_build_beep_pcm
+#
+# Uses the CDP1802 core to generate 8000 samples (1 second at 8 kHz) into
+# chip8_beep_pcm. The resulting memory block [chip8_beep_wav .. ] is a valid
+# in-memory WAV image for PlaySoundA with SND_MEMORY | SND_LOOP.
+#
+# Steps:
+#   - cdp1802_init()
+#   - cdp1802_load(cdp1802_beep_rom, 0x0000, CDP1802_BEEP_ROM_SIZE)
+#   - For i in 0..7999:
+#       sample = cdp1802_audio_sample(1);  // 1 step per sample (≈2kHz beep)
+#       chip8_beep_pcm[i] = sample;
+# ----------------------------------------------------------------------------
+chip8_build_beep_pcm:
+    pushq %rbp
+    movq  %rsp, %rbp
+
+    # Initialize 1802 core
+    call  cdp1802_init
+
+    # Load beep ROM at address 0x0000
+    leaq  cdp1802_beep_rom(%rip), %rcx   # src
+    xorl  %edx, %edx                     # addr = 0
+    movl  $CDP1802_BEEP_ROM_SIZE, %r8d   # len
+    call  cdp1802_load
+
+    # Generate 8000 samples into chip8_beep_pcm
+    leaq  chip8_beep_pcm(%rip), %r10
+    movl  $8000, %r11d
+
+.Lbb_loop:
+    movl  $1, %ecx                       # steps_per_sample = 1
+    call  cdp1802_audio_sample           # AL = sample 0..255
+    movb  %al, (%r10)
+    incq  %r10
+    decl  %r11d
+    jnz   .Lbb_loop
+
+    popq  %rbp
+    ret
+
+
+# ----------------------------------------------------------------------------
 # void chip8_tick_timers(void)
 #
-# Decrements delay and sound timers at 60 Hz, if non-zero.
-# Must be called periodically (e.g., from WM_TIMER) to emulate real hardware.
+# 60Hz Timer:
+# - If delay > 0, decrement by 1
+# - If sound > 0, decrement by 1
+# - If sound > 0, call chip8_start_beep()
+# - If sound == 0, call chip8_stop_beep()
 # ----------------------------------------------------------------------------
 chip8_tick_timers:
     pushq %rbp
     movq  %rsp, %rbp
+
+    # RBX is non-volatile, so it is safest to push/pop it directly.
     pushq %rbx
+
+    # Win64: Ensure at least 32 bytes of shadow space
+    subq  $32, %rsp
 
     leaq  chip8_state(%rip), %rbx
 
+    # -------------------------
+    # Reduce Delay Timer
+    # -------------------------
     movzbl OFF_DELAY(%rbx), %eax
     testb %al, %al
     jz    .Lct_no_delay
@@ -297,13 +413,33 @@ chip8_tick_timers:
     movb  %al, OFF_DELAY(%rbx)
 .Lct_no_delay:
 
+    # -------------------------
+    # Reduce Sound Timer
+    # -------------------------
     movzbl OFF_SOUND(%rbx), %eax
     testb %al, %al
-    jz    .Lct_no_sound
+    jz    .Lct_after_sound_dec
     decb  %al
     movb  %al, OFF_SOUND(%rbx)
-.Lct_no_sound:
+.Lct_after_sound_dec:
 
+    # -------------------------
+    # Sound on/off toggle
+    # -------------------------
+    movzbl OFF_SOUND(%rbx), %eax
+    testb %al, %al
+    jz    .Lct_sound_off
+
+    # ST > 0 -> Always on
+    call  chip8_start_beep
+    jmp   .Lct_done
+
+.Lct_sound_off:
+    # ST == 0 -> should be off
+    call  chip8_stop_beep
+
+.Lct_done:
+    addq  $32, %rsp
     popq  %rbx
     popq  %rbp
     ret
@@ -383,7 +519,7 @@ rng_next_byte:
     ret
 
 
-# ============================================================================
+# ============================================================================  
 # chip8_step
 #
 # void chip8_step(void)
@@ -395,7 +531,7 @@ rng_next_byte:
 #   - If no key is pressed, interpreter enters a "waiting" state:
 #       WAITFLAG = 1, WAITREG = x, and subsequent chip8_step calls do nothing
 #       until a key press event arrives via chip8_set_key.
-# ============================================================================
+# ============================================================================  
 chip8_step:
     pushq %rbp
     movq  %rsp, %rbp
@@ -788,7 +924,7 @@ chip8_step:
     subl   %eax, %edx
     andl   $0xFF, %edx
     movb   %dl, OFF_V(%rbx,%rcx,1)
-    jmp    .STEP_END
+    jmp   .STEP_END
 
 .OP_8xyE:                  # SHL Vx {, Vy}
     #   VF = MSB(Vy)
@@ -1244,7 +1380,7 @@ chip8_step:
 
 
 
-# ============================================================================
+# ============================================================================  
 # chip8_render_window(HWND hWnd, HDC hdc)
 #
 # RCX = hWnd (unused here, but passed for API consistency)
@@ -1255,7 +1391,7 @@ chip8_step:
 #   - Background is cleared using the window class background brush (black).
 #   - Only pixels with value 1 are drawn.
 #   - After drawing, the DIRTY flag is cleared to 0.
-# ============================================================================
+# ============================================================================  
 chip8_render_window:
     pushq %rbp
     movq  %rsp, %rbp
@@ -1341,14 +1477,14 @@ chip8_render_window:
 
 
 
-# ============================================================================
+# ============================================================================  
 # load_rom(const char *filename)
 #
 # RCX = filename (char const *)
 #
 # Opens the ROM file, reads it into memory starting at 0x200, and prints a
 # small debug dump of the first 4 bytes at 0x200.
-# ============================================================================
+# ============================================================================  
 load_rom:
     pushq %rbp
     movq  %rsp, %rbp
@@ -1427,7 +1563,7 @@ load_rom:
     ret
 
 
-# ============================================================================
+# ============================================================================  
 # map_key
 #
 # Input:
@@ -1441,7 +1577,7 @@ load_rom:
 #   Q W E R       -> 4 5 6 D
 #   A S D F       -> 7 8 9 E
 #   Z X C V       -> A 0 B F
-# ============================================================================
+# ============================================================================  
 map_key:
     movl  $-1, %ecx
 
@@ -1512,7 +1648,7 @@ map_key:
     ret
 
 
-# ============================================================================
+# ============================================================================  
 # WndProc – Window procedure
 #
 # LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -1527,7 +1663,7 @@ map_key:
 #   - WM_TIMER   -> steps the CHIP-8 CPU, ticks timers, and invalidates window
 #   - WM_KEYDOWN / WM_KEYUP -> updates key state (ESC quits)
 #   - WM_DESTROY -> kills timer and posts WM_QUIT
-# ============================================================================
+# ============================================================================  
 WndProc:
     pushq %rbp
     movq  %rsp, %rbp
@@ -1573,6 +1709,9 @@ WndProc_do_paint:
     jmp   WndProc_ret
 
 WndProc_do_destroy:
+    # CHIP-8 sound may be playing, so force stop it first
+    call  chip8_stop_beep
+
     # Kill the timer
     movq  hWndMain(%rip), %rcx
     movl  $TIMER_ID_STEP, %edx
@@ -1662,7 +1801,68 @@ WndProc_ret:
     ret
 
 
-# ============================================================================
+# ============================================================================  
+# Sound helpers (no separate thread)
+#
+# chip8_start_beep:
+# - If OFF_SOUND > 0 and no sound is playing,
+#   just start PlaySoundA on the pre-rendered CDP1802 beep WAV.
+#
+# chip8_stop_beep:
+# - If currently playing, stop it with PlaySoundA(NULL, NULL, 0).
+#
+# Only called from chip8_tick_timers() and WndProc_do_destroy().
+# chip8_sound_on_flag tracks "already playing" state.
+# ============================================================================  
+chip8_start_beep:
+    pushq %rbp
+    movq  %rsp, %rbp
+    subq  $32, %rsp                 # shadow space for PlaySoundA
+
+    # If already playing, do nothing
+    movzbl chip8_sound_on_flag(%rip), %eax
+    testb %al, %al
+    jnz   .Lcsb_done
+
+    movb  $1, chip8_sound_on_flag(%rip)
+
+    # PlaySoundA(chip8_beep_wav, NULL,
+    #            SND_ASYNC | SND_MEMORY | SND_NODEFAULT | SND_LOOP);
+    leaq  chip8_beep_wav(%rip), %rcx   # pszSound (memory)
+    xorl  %edx, %edx                   # hmod = NULL
+    movl  $(SND_ASYNC|SND_MEMORY|SND_NODEFAULT|SND_LOOP), %r8d
+    call  PlaySoundA
+
+.Lcsb_done:
+    addq  $32, %rsp
+    popq  %rbp
+    ret
+
+chip8_stop_beep:
+    pushq %rbp
+    movq  %rsp, %rbp
+    subq  $32, %rsp                   # shadow space for PlaySoundA
+
+    # If it's already off, do nothing
+    movzbl chip8_sound_on_flag(%rip), %eax
+    testb %al, %al
+    jz    .Lctb_done
+
+    movb  $0, chip8_sound_on_flag(%rip)
+
+    # PlaySoundA(NULL, NULL, 0); -> Stops the current sound
+    xorl  %ecx, %ecx
+    xorl  %edx, %edx
+    xorl  %r8d, %r8d
+    call  PlaySoundA
+
+.Lctb_done:
+    addq  $32, %rsp
+    popq  %rbp
+    ret
+
+
+# ============================================================================  
 # main(int argc, char** argv)
 #
 # Windows x64:
@@ -1676,7 +1876,7 @@ WndProc_ret:
 #   - Create GDI brushes
 #   - Set timer for CPU stepping
 #   - Run GetMessage-based message loop
-# ============================================================================
+# ============================================================================  
 main:
     pushq %rbp
     movq  %rsp, %rbp
@@ -1706,7 +1906,7 @@ main:
     xorl  %eax, %eax
     call  printf
 
-    # Initialize CHIP-8 state
+    # Initialize CHIP-8 state (also builds CDP1802-based beep PCM)
     call  chip8_init
 
     # Load ROM into memory
