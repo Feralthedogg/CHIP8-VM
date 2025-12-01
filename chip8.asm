@@ -16,7 +16,7 @@
     #   - Timer-based CPU stepping at ~60 Hz
     #   - Dirty-flag based rendering (only repaint when display changes)
     #   - Fx0A "wait for key" semantics using a non-blocking, event-driven scheme
-    #   - Sound: OFF_SOUND > 0 → CDP1802-based beep (pre-rendered 1s WAV)
+    #   - Sound: OFF_SOUND > 0 -> CDP1802-based beep (pre-rendered 1s WAV)
     # =========================================================================
 
     .section .bss
@@ -395,11 +395,9 @@ chip8_tick_timers:
     pushq %rbp
     movq  %rsp, %rbp
 
-    # RBX is non-volatile, so it is safest to push/pop it directly.
     pushq %rbx
 
-    # Win64: Ensure at least 32 bytes of shadow space
-    subq  $32, %rsp
+    subq  $40, %rsp
 
     leaq  chip8_state(%rip), %rbx
 
@@ -439,7 +437,7 @@ chip8_tick_timers:
     call  chip8_stop_beep
 
 .Lct_done:
-    addq  $32, %rsp
+    addq  $40, %rsp
     popq  %rbx
     popq  %rbp
     ret
