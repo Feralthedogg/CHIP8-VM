@@ -39,64 +39,107 @@
 
     # Fx0A waiting state:
     #   - WAITFLAG = 0 -> not waiting
-    #   - WAITFLAG = 1 -> Fx0A is currently blocking for a key
-    #   - WAITREG = index of Vx where the key value should be stored
-    .equ OFF_WAITFLAG,  OFF_DIRTY + 1        # 1 = waiting for key (Fx0A)
-    .equ OFF_WAITREG,   OFF_WAITFLAG + 1     # target V register index (0..15)
+    #   - WAITFLAG = 1 -> waiting for key down (press)
+    #   - WAITFLAG = 2 -> waiting for key up (release)
+    #   - WAITREG  = index of Vx (0..15)
+    #   - WAITKEY  = index of the key being waited for (0..15)
+    .equ OFF_WAITFLAG,  OFF_DIRTY + 1
+    .equ OFF_WAITREG,   OFF_WAITFLAG + 1
+    .equ OFF_WAITKEY,   OFF_WAITREG + 1
 
-    .equ CHIP8_SIZE,    OFF_WAITREG + 1      # Total size of chip8_state
+    .equ CHIP8_SIZE,    OFF_WAITKEY + 1      # Total size of chip8_state
 
+    # Audio Constants for waveOut
+    .equ AUDIO_SR,          8000
+    .equ AUDIO_BUF_SAMPLES, 160
+    .equ AUDIO_NUM_BUFS,    3
+
+    .section .bss
+    .align 8
     .globl chip8_state
 chip8_state:
     .space CHIP8_SIZE                       # Single instance of CHIP-8 VM state
-
     .globl chip8_rng_state
 chip8_rng_state:
-    .long 0                                 # Simple LCG RNG state (zero init)
-
-    # Whether sound(PlaySound) is currently playing on the Windows side.
-    # 0 = Not playing.
-    # 1 = Playing.
-    .globl chip8_sound_on_flag
-chip8_sound_on_flag:
-    .byte 0
-
-    # -------------------------------------------------------------------------
-    # Win32 globals
-    # -------------------------------------------------------------------------
+    .long 0
+    .globl chip8_qpc_freq
+chip8_qpc_freq:       .quad 0
+    .globl chip8_qpc_last
+chip8_qpc_last:       .quad 0
+    .globl chip8_cpu_accum
+chip8_cpu_accum:      .quad 0
+    .globl chip8_timer_accum
+chip8_timer_accum:    .quad 0
     .globl hInstance
-hInstance:
-    .quad 0                                 # Process HINSTANCE
-
+hInstance:            .quad 0
     .globl hWndMain
-hWndMain:
-    .quad 0                                 # Main application window handle
-
+hWndMain:             .quad 0
     .globl hBrushOn
-hBrushOn:
-    .quad 0                                 # GDI brush for "pixel on" (white)
-
+hBrushOn:             .quad 0
     .globl hBrushOff
-hBrushOff:
-    .quad 0                                 # GDI brush for "pixel off" (black)
-
+hBrushOff:            .quad 0
     .globl rom_filename
-rom_filename:
-    .quad 0                                 # Pointer to ROM filename (argv[1])
+rom_filename:         .quad 0
 
-    # -------------------------------------------------------------------------
-    # Fixed-size Win32 helper buffers
-    # -------------------------------------------------------------------------
-msg_buf:
-    .space 56                               # MSG structure
-wcex_buf:
-    .space 80                               # WNDCLASSEX structure
-ps_buf:
-    .space 72                               # PAINTSTRUCT structure
-rect_buf:
-    .space 16                               # RECT structure
-read_bytes:
-    .long 0                                 # Number of bytes read by ReadFile
+msg_buf:              .space 56
+wcex_buf:             .space 80
+ps_buf:               .space 72
+rect_buf:             .space 16
+read_bytes:           .long 0
+
+    .globl chip8_hWaveOut
+chip8_hWaveOut:       .quad 0
+    .globl chip8_audio_running
+chip8_audio_running:  .byte 0
+
+    # PCM buffers
+chip8_audio_buf0:     .space AUDIO_BUF_SAMPLES
+chip8_audio_buf1:     .space AUDIO_BUF_SAMPLES
+chip8_audio_buf2:     .space AUDIO_BUF_SAMPLES
+
+    # WAVEHDR structures
+    .align 8
+chip8_hdr0:           .space 48
+chip8_hdr1:           .space 48
+chip8_hdr2:           .space 48
+
+    .section .data
+    .align 8
+    .globl chip8_target_ips
+chip8_target_ips:     .long 700   # Instructions Per Second
+    .globl chip8_max_steps_per_tick
+chip8_max_steps_per_tick: .long 4000  # Cap to prevent runaway
+    .globl chip8_audio_volume
+chip8_audio_volume:   .byte 255
+
+    # WAVEFORMATEX (18 bytes)
+    .align 4
+chip8_wfx:
+    .word 1              # wFormatTag = PCM
+    .word 1              # nChannels
+    .long AUDIO_SR       # nSamplesPerSec
+    .long AUDIO_SR       # nAvgBytesPerSec
+    .word 1              # nBlockAlign
+    .word 8              # wBitsPerSample
+    .word 0              # cbSize
+    .word 0              # padding
+
+    # BITMAPINFO for 64x32 8bpp DIB
+    .align 4
+chip8_bmi:
+    .long 40             # biSize = sizeof(BITMAPINFOHEADER)
+    .long 64             # biWidth
+    .long -32            # biHeight (top-down)
+    .word 1              # biPlanes
+    .word 8              # biBitCount
+    .long 0              # biCompression (BI_RGB)
+    .long 2048           # biSizeImage (64*32)
+    .long 0              # biXPelsPerMeter
+    .long 0              # biYPelsPerMeter
+    .long 2              # biClrUsed (Black, White)
+    .long 0              # biClrImportant
+    .long 0x00000000     # Palette Index 0: Black (B,G,R,A)
+    .long 0x00FFFFFF     # Palette Index 1: White
 
     .section .rodata
     # -------------------------------------------------------------------------
@@ -148,32 +191,7 @@ className:
 windowTitle:
     .string "CHIP-8 VM"
 
-    # ---------------------------------------------------------------------
-    # WAV header for 1-second, 8 kHz, 8-bit mono PCM.
-    # PCM data (8000 bytes) is generated at runtime using CDP1802 audio core
-    # and stored immediately after this header.
-    # ---------------------------------------------------------------------
-
-    .section .data
-    .align 4
-chip8_beep_wav:
-    .ascii "RIFF"
-    .long 8036                # ChunkSize = 36 + Subchunk2Size (8000)
-    .ascii "WAVE"
-    .ascii "fmt "
-    .long 16                  # Subchunk1Size (PCM)
-    .word 1                   # AudioFormat = 1 (PCM)
-    .word 1                   # NumChannels = 1
-    .long 8000                # SampleRate = 8000 Hz
-    .long 8000                # ByteRate = SampleRate * Channels * Bits/8
-    .word 1                   # BlockAlign = Channels * Bits/8
-    .word 8                   # BitsPerSample = 8
-    .ascii "data"
-    .long 8000                # Subchunk2Size = 8000 bytes (1 second)
-
-# 8000 bytes of PCM data will be filled at runtime from cdp1802_audio_sample
-chip8_beep_pcm:
-    .space 8000
+# Static beep data no longer needed for waveOut streaming
 
     .section .text
     .globl chip8_init
@@ -184,9 +202,8 @@ chip8_beep_pcm:
     .globl WndProc
     .globl load_rom
     .globl main
-    .globl chip8_build_beep_pcm
-    .globl chip8_start_beep
-    .globl chip8_stop_beep
+    .globl chip8_audio_init
+    .globl chip8_audio_cleanup
 
     # -------------------------------------------------------------------------
     # External C / Win32 APIs
@@ -212,12 +229,23 @@ chip8_beep_pcm:
     .extern CreateFileA
     .extern ReadFile
     .extern CloseHandle
+    .extern StretchDIBits
 
     .extern GetMessageA
     .extern SetTimer
     .extern KillTimer
 
-    .extern PlaySoundA
+    # QPC
+    .extern QueryPerformanceCounter
+    .extern QueryPerformanceFrequency
+
+    # waveOut
+    .extern waveOutOpen
+    .extern waveOutPrepareHeader
+    .extern waveOutWrite
+    .extern waveOutReset
+    .extern waveOutUnprepareHeader
+    .extern waveOutClose
 
     # -------------------------------------------------------------------------
     # External CDP1802 core / audio (from cdp1802.asm)
@@ -226,9 +254,8 @@ chip8_beep_pcm:
     .extern cdp1802_load
     .extern cdp1802_audio_sample
     .extern cdp1802_beep_rom
-
-    # size of the beep ROM in bytes (REQ / LBR / SEQ / LBR)
-    .equ CDP1802_BEEP_ROM_SIZE, 8
+    .extern cdp1802_beep_rom_end
+    .extern cdp1802_gate
 
     # -------------------------------------------------------------------------
     # Win32 constants
@@ -239,6 +266,14 @@ chip8_beep_pcm:
     .equ WM_KEYUP,     0x0101
     .equ WM_TIMER,     0x0113
     .equ WM_QUIT,      0x0012
+
+    .equ TIMER_ID_STEP, 1
+    .equ TIMER_INTERVAL_MS, 16      # ~60 Hz (1000 / 16 ≈ 62.5)
+
+    # waveOut Constants
+    .equ CALLBACK_WINDOW,   0x00010000
+    .equ WAVE_MAPPER,       -1
+    .equ MM_WOM_DONE,       0x3BD
 
     .equ CS_VREDRAW,   0x0001
     .equ CS_HREDRAW,   0x0002
@@ -268,9 +303,6 @@ chip8_beep_pcm:
     .equ FILE_ATTRIBUTE_NORMAL, 0x00000080
     .equ INVALID_HANDLE_VALUE, -1
 
-    # Timer constants
-    .equ TIMER_ID_STEP,      1      # Timer ID used for CPU stepping
-    .equ TIMER_INTERVAL_MS, 16      # ~60 Hz (1000 / 16 ≈ 62.5)
 
     # PlaySound Flags
     .equ SND_SYNC,          0x0000
@@ -302,6 +334,9 @@ chip8_init:
     pushq %rsi
     pushq %rdi
 
+    # Win64 ABI: allocate 32B shadow space + 8B alignment
+    subq  $40, %rsp
+
     leaq  chip8_state(%rip), %rbx
 
     movl  $CHIP8_SIZE, %ecx
@@ -329,9 +364,7 @@ chip8_init:
     # Initialize RNG seed to 1
     movl  $1, chip8_rng_state(%rip)
 
-    # Build beep PCM (1s @ 8kHz) via CDP1802 audio core
-    call  chip8_build_beep_pcm
-
+    addq  $40, %rsp
     popq  %rdi
     popq  %rsi
     popq  %rbx
@@ -339,47 +372,7 @@ chip8_init:
     ret
 
 
-# ----------------------------------------------------------------------------
-# chip8_build_beep_pcm
-#
-# Uses the CDP1802 core to generate 8000 samples (1 second at 8 kHz) into
-# chip8_beep_pcm. The resulting memory block [chip8_beep_wav .. ] is a valid
-# in-memory WAV image for PlaySoundA with SND_MEMORY | SND_LOOP.
-#
-# Steps:
-#   - cdp1802_init()
-#   - cdp1802_load(cdp1802_beep_rom, 0x0000, CDP1802_BEEP_ROM_SIZE)
-#   - For i in 0..7999:
-#       sample = cdp1802_audio_sample(1);  // 1 step per sample (≈2kHz beep)
-#       chip8_beep_pcm[i] = sample;
-# ----------------------------------------------------------------------------
-chip8_build_beep_pcm:
-    pushq %rbp
-    movq  %rsp, %rbp
 
-    # Initialize 1802 core
-    call  cdp1802_init
-
-    # Load beep ROM at address 0x0000
-    leaq  cdp1802_beep_rom(%rip), %rcx   # src
-    xorl  %edx, %edx                     # addr = 0
-    movl  $CDP1802_BEEP_ROM_SIZE, %r8d   # len
-    call  cdp1802_load
-
-    # Generate 8000 samples into chip8_beep_pcm
-    leaq  chip8_beep_pcm(%rip), %r10
-    movl  $8000, %r11d
-
-.Lbb_loop:
-    movl  $1, %ecx                       # steps_per_sample = 1
-    call  cdp1802_audio_sample           # AL = sample 0..255
-    movb  %al, (%r10)
-    incq  %r10
-    decl  %r11d
-    jnz   .Lbb_loop
-
-    popq  %rbp
-    ret
 
 
 # ----------------------------------------------------------------------------
@@ -388,58 +381,33 @@ chip8_build_beep_pcm:
 # 60Hz Timer:
 # - If delay > 0, decrement by 1
 # - If sound > 0, decrement by 1
-# - If sound > 0, call chip8_start_beep()
-# - If sound == 0, call chip8_stop_beep()
+# - Sets cdp1802_gate: 1 if sound > 0, else 0
 # ----------------------------------------------------------------------------
 chip8_tick_timers:
-    pushq %rbp
-    movq  %rsp, %rbp
+    leaq  chip8_state(%rip), %rax
 
-    pushq %rbx
+    # Delay Timer
+    movzbl OFF_DELAY(%rax), %ecx
+    testl %ecx, %ecx
+    jz    1f
+    decl  %ecx
+    movb  %cl, OFF_DELAY(%rax)
+1:
+    # Sound Timer
+    movzbl OFF_SOUND(%rax), %edx
+    testl %edx, %edx
+    jz    .Lst_zero
 
-    subq  $40, %rsp
+    # Still sounding
+    movb  $1, cdp1802_gate(%rip)    # Gate on
+    decl  %edx
+    movb  %dl, OFF_SOUND(%rax)
+    jmp   .Ltt_done
 
-    leaq  chip8_state(%rip), %rbx
+.Lst_zero:
+    movb  $0, cdp1802_gate(%rip)    # Gate off
 
-    # -------------------------
-    # Reduce Delay Timer
-    # -------------------------
-    movzbl OFF_DELAY(%rbx), %eax
-    testb %al, %al
-    jz    .Lct_no_delay
-    decb  %al
-    movb  %al, OFF_DELAY(%rbx)
-.Lct_no_delay:
-
-    # -------------------------
-    # Reduce Sound Timer
-    # -------------------------
-    movzbl OFF_SOUND(%rbx), %eax
-    testb %al, %al
-    jz    .Lct_after_sound_dec
-    decb  %al
-    movb  %al, OFF_SOUND(%rbx)
-.Lct_after_sound_dec:
-
-    # -------------------------
-    # Sound on/off toggle
-    # -------------------------
-    movzbl OFF_SOUND(%rbx), %eax
-    testb %al, %al
-    jz    .Lct_sound_off
-
-    # ST > 0 -> Always on
-    call  chip8_start_beep
-    jmp   .Lct_done
-
-.Lct_sound_off:
-    # ST == 0 -> should be off
-    call  chip8_stop_beep
-
-.Lct_done:
-    addq  $40, %rsp
-    popq  %rbx
-    popq  %rbp
+.Ltt_done:
     ret
 
 
@@ -466,26 +434,38 @@ chip8_set_key:
     setne %al                      # AL = 1 if pressed != 0
     movb  %al, OFF_KEYS(%rbx,%rcx,1)
 
-    # --------------------------------------------------------
-    # Fx0A completion logic:
-    # If this is a KEY DOWN event and Fx0A is waiting,
-    #   V[WAITREG] = key index
-    #   WAITFLAG   = 0 (resume execution)
-    # --------------------------------------------------------
-    testl %edx, %edx               # pressed? (non-zero)
-    jz    .Lck_done                # key up -> do nothing for Fx0A
-
     movzbl OFF_WAITFLAG(%rbx), %eax
     testl  %eax, %eax
     jz     .Lck_done               # not in Fx0A wait
 
-    # We are in Fx0A "waiting for next press".
-    movzbl OFF_WAITREG(%rbx), %eax # EAX = target V-register index
+    cmpl   $1, %eax
+    je     .Lck_wait_press
+    cmpl   $2, %eax
+    je     .Lck_wait_release
+    jmp    .Lck_done
+
+.Lck_wait_press:
+    testl %edx, %edx               # pressed?
+    jz    .Lck_done                # no, ignore key-up in this state
+    # Key down event: capture key and transition to Wait Release
+    movb  %cl, OFF_WAITKEY(%rbx)
+    movb  $2,  OFF_WAITFLAG(%rbx)
+    jmp   .Lck_done
+
+.Lck_wait_release:
+    testl %edx, %edx               # pressed?
+    jnz   .Lck_done                # ignore additional key-downs
+
+    # Key up event: check if it's the key we are waiting for
+    movzbl OFF_WAITKEY(%rbx), %eax
+    cmpl  %eax, %ecx
+    jne   .Lck_done                # not the right key
+
+    # Found release! Vx = key index, and resume.
+    movzbl OFF_WAITREG(%rbx), %eax
     andl   $0x0F, %eax
-
-    movb   %cl, OFF_V(%rbx,%rax,1) # V[target] = key index (ECX = key)
-
-    movb   $0, OFF_WAITFLAG(%rbx)  # clear wait state
+    movb   %cl, OFF_V(%rbx,%rax,1)
+    movb   $0,  OFF_WAITFLAG(%rbx)
 
 .Lck_done:
     popq  %rbx
@@ -567,12 +547,12 @@ chip8_step:
     # RSI = pointer to memory[0]
     leaq  OFF_MEMORY(%rbx), %rsi
 
-    # ------------------------------------------------------
     # Fetch 16-bit opcode: memory[PC] << 8 | memory[PC + 1]
-    # ------------------------------------------------------
     movzbl (%rsi,%rcx,1), %edx
     shll   $8, %edx
-    movzbl 1(%rsi,%rcx,1), %edi
+    incq   %rcx
+    andq   $0x0FFF, %rcx           # Wrap PC+1 safely
+    movzbl (%rsi,%rcx,1), %edi
     orl    %edi, %edx
     movl   %edx, %r13d             # R13D = opcode
 
@@ -858,33 +838,23 @@ chip8_step:
     jmp    .STEP_END
 
 .OP_8xy4:                  # ADD Vx, Vy (with carry -> VF)
-    movzbl OFF_V(%rbx,%rcx,1), %eax
-    movzbl OFF_V(%rbx,%rdi,1), %esi
-    movb   $0, OFF_V+15(%rbx)
-    addl   %esi, %eax
-    cmpl   $0xFF, %eax
-    jbe    .Lno_carry_8xy4
-    movb   $1, OFF_V+15(%rbx)
-.Lno_carry_8xy4:
-    andl   $0xFF, %eax
-    movb   %al, OFF_V(%rbx,%rcx,1)
+    movzbl OFF_V(%rbx,%rcx,1), %eax      # AL = Vx
+    movzbl OFF_V(%rbx,%rdi,1), %esi      # SIL = Vy
+    addb   %sil, %al                     # 8-bit addition, sets CF for 8-bit carry
+    setc   %dl                           # DL = carry flag
+    movb   %al, OFF_V(%rbx,%rcx,1)       # Store result in Vx first
+    movb   %dl, OFF_V+15(%rbx)           # Store carry in VF last
     jmp    .STEP_END
 
 .OP_8xy5:                  # SUB Vx, Vy (VF = !borrow)
     movzbl OFF_V(%rbx,%rcx,1), %eax
     movzbl OFF_V(%rbx,%rdi,1), %esi
-    movb   $0, OFF_V+15(%rbx)
+    xorl   %edx, %edx
     cmpl   %esi, %eax
-    jb     .Lborrow_8xy5
-    movb   $1, OFF_V+15(%rbx)
+    setae  %dl                         # DL = 1 if Vx >= Vy (no borrow)
     subl   %esi, %eax
-    andl   $0xFF, %eax
-    movb   %al, OFF_V(%rbx,%rcx,1)
-    jmp    .STEP_END
-.Lborrow_8xy5:
-    subl   %esi, %eax
-    andl   $0xFF, %eax
-    movb   %al, OFF_V(%rbx,%rcx,1)
+    movb   %al, OFF_V(%rbx,%rcx,1)     # Store result in Vx first
+    movb   %dl, OFF_V+15(%rbx)         # Store !borrow in VF last (survives x=F)
     jmp    .STEP_END
 
 # Classic CHIP-8 quirk:
@@ -892,52 +862,41 @@ chip8_step:
 .OP_8xy6:                  # SHR Vx {, Vy}
     #   VF = LSB(Vy)
     #   Vx = Vy >> 1
-    movl  %ecx, %esi                  # Save x index in ESI
+    movl  %ecx, %esi                  # ESI = x index
     movl  %edi, %ecx                  # ECX = y index
     movzbl OFF_V(%rbx,%rcx,1), %eax   # EAX = Vy
-    movb  $0, OFF_V+15(%rbx)          # VF = 0
-    testb $1, %al
-    jz    .Lno_lsb_8xy6
-    movb  $1, OFF_V+15(%rbx)          # If LSB(Vy) == 1, VF = 1
-.Lno_lsb_8xy6:
-    shrb  $1, %al                     # AL = Vy >> 1
-    movl  %esi, %ecx                  # Restore x index
-    movb  %al, OFF_V(%rbx,%rcx,1)     # Vx = result
+    movl  %eax, %edx
+    andl  $1, %edx                    # EDX = LSB(Vy)
+    shrb  $1, %al                     # AL = result
+    movl  %esi, %ecx                  # ECX = x index
+    movb  %al, OFF_V(%rbx,%rcx,1)     # Vx = result first
+    movb  %dl, OFF_V+15(%rbx)         # VF = LSB(Vy) last
     jmp   .STEP_END
 
 .OP_8xy7:                  # SUBN Vx, Vy (Vx = Vy - Vx; VF = !borrow)
     movzbl OFF_V(%rbx,%rcx,1), %eax   # EAX = Vx
     movzbl OFF_V(%rbx,%rdi,1), %esi   # ESI = Vy
-    movb   $0, OFF_V+15(%rbx)
+    xorl   %edx, %edx
     cmpl   %eax, %esi
-    jb     .Lborrow_8xy7
-    movb   $1, OFF_V+15(%rbx)
-    movl   %esi, %edx
-    subl   %eax, %edx
-    andl   $0xFF, %edx
-    movb   %dl, OFF_V(%rbx,%rcx,1)
+    setae  %dl                         # DL = 1 if Vy >= Vx (no borrow)
+    subl   %eax, %esi
+    movb   %sil, OFF_V(%rbx,%rcx,1)    # Vx = result first
+    movb   %dl, OFF_V+15(%rbx)         # VF = !borrow last
     jmp    .STEP_END
-.Lborrow_8xy7:
-    movl   %esi, %edx
-    subl   %eax, %edx
-    andl   $0xFF, %edx
-    movb   %dl, OFF_V(%rbx,%rcx,1)
-    jmp   .STEP_END
 
 .OP_8xyE:                  # SHL Vx {, Vy}
     #   VF = MSB(Vy)
     #   Vx = Vy << 1
-    movl  %ecx, %esi                  # Save x index
+    movl  %ecx, %esi                  # ESI = x index
     movl  %edi, %ecx                  # ECX = y index
     movzbl OFF_V(%rbx,%rcx,1), %eax   # EAX = Vy
-    movb  $0, OFF_V+15(%rbx)          # VF = 0
-    testb $0x80, %al
-    jz    .Lno_msb_8xye
-    movb  $1, OFF_V+15(%rbx)          # If MSB(Vy) == 1, VF = 1
-.Lno_msb_8xye:
-    shlb  $1, %al                     # AL = Vy << 1
-    movl  %esi, %ecx                  # Restore x index
-    movb  %al, OFF_V(%rbx,%rcx,1)     # Vx = result
+    movl  %eax, %edx
+    shrl  $7, %edx
+    andl  $1, %edx                    # EDX = MSB(Vy)
+    shlb  $1, %al                     # AL = result
+    movl  %esi, %ecx                  # ECX = x index
+    movb  %al, OFF_V(%rbx,%rcx,1)     # Vx = result first
+    movb  %dl, OFF_V+15(%rbx)         # VF = MSB(Vy) last
     jmp   .STEP_END
 
 
@@ -1034,9 +993,11 @@ chip8_step:
     andl  $0x000F, %eax
     movl  %eax, %r10d           # R10D = height (N rows)
 
-    # Read Vx, Vy
+    # Read Vx, Vy and wrap START coordinates (Classic requirement)
     movzbl OFF_V(%rbx,%rcx,1), %r8d  # R8D = Vx
+    andl  $63, %r8d
     movzbl OFF_V(%rbx,%rdx,1), %r9d  # R9D = Vy
+    andl  $31, %r9d
 
     # VF = 0 (no collision yet)
     movb  $0, OFF_V+15(%rbx)
@@ -1068,12 +1029,12 @@ chip8_step:
     testb $0x80, %r13b          # test MSB of spriteByte
     jz    .Lskip_bit
 
-    # x = (Vx + bit) & 63
+    # x = (base_x + bit) & 63
     movl  %r8d, %ecx
     addl  %r14d, %ecx
     andl  $63, %ecx
 
-    # y = (Vy + row) & 31
+    # y = (base_y + row) & 31
     movl  %r9d, %edx
     addl  %r12d, %edx
     andl  $31, %edx
@@ -1195,21 +1156,19 @@ chip8_step:
     jmp    .STEP_END
 
 # ----------------------------------------------------------------------------
-# Fx0A: LD Vx, K  (wait for a key, event-driven, non-blocking)
+# Fx0A: LD Vx, K  (Wait for key release; event-driven, non-blocking)
 #
-# Semantics:
-#   - If ANY key is currently pressed: Vx = that key index, continue.
+# Semantics (Classic Release-based):
+#   - If ANY key is currently pressed: 
+#       WAITFLAG = 2 (Wait for Release), WAITKEY = index of that key,
+#       WAITREG = x. No return to execution yet.
 #   - If no key is pressed:
-#       WAITFLAG = 1, WAITREG = x
-#       PC is already advanced to the next instruction and is NOT modified.
-#       Subsequent chip8_step() calls do nothing while WAITFLAG != 0.
-#       When chip8_set_key() sees a key press, it writes V[WAITREG] and
-#       clears WAITFLAG, then execution resumes from the next opcode.
+#       WAITFLAG = 1 (Wait for Press).
+#   
+# When a key up event (WM_KEYUP) arrives for the target WAITKEY:
+#   V[WAITREG] = WAITKEY, WAITFLAG = 0, resume execution.
 # ----------------------------------------------------------------------------
 .OP_Fx0A:
-    # At this point WAITFLAG must be 0, because chip8_step() bails out
-    # early when WAITFLAG != 0.
-
     # Phase 0: check if there is already a key held down.
     movl   $0, %edi                    # EDI = key index (0..15)
 
@@ -1221,8 +1180,10 @@ chip8_step:
     testl  %eax, %eax
     jz     .Lfx0a_next_key             # this key not pressed -> next
 
-    # Found a pressed key -> Vx = key index, done.
-    movb   %dil, OFF_V(%rbx,%rcx,1)    # Vx = EDI (key index)
+    # Found a pressed key -> Transition to "Wait for Release" state.
+    movb   $2,  OFF_WAITFLAG(%rbx)
+    movb   %cl, OFF_WAITREG(%rbx)      # remember Vx index
+    movb   %dil, OFF_WAITKEY(%rbx)     # remember which key to wait for release
     jmp    .STEP_END
 
 .Lfx0a_next_key:
@@ -1230,10 +1191,9 @@ chip8_step:
     jmp    .Lfx0a_scan_pressed
 
 .Lfx0a_no_key:
-    # No key is currently pressed:
-    # enter "wait for key" state, without touching PC.
-    movb   $1,  OFF_WAITFLAG(%rbx)     # Fx0A is now blocking on a key
-    movb   %cl, OFF_WAITREG(%rbx)      # remember x (Vx index)
+    # No key is currently pressed: enter "Wait for Press" state level 1.
+    movb   $1,  OFF_WAITFLAG(%rbx)
+    movb   %cl, OFF_WAITREG(%rbx)
     jmp    .STEP_END
 
 
@@ -1393,83 +1353,38 @@ chip8_step:
 chip8_render_window:
     pushq %rbp
     movq  %rsp, %rbp
+    subq  $128, %rsp                 # 32 (shadow) + 96 (stack args)
 
-    pushq %rbx        # Save non-volatile and working registers
-    pushq %rsi
-    pushq %rdi
-    pushq %r12
-    pushq %r13
-    pushq %r14        # Padding / spare
+    movq  %rdx, %rcx                 # Arg 1: hdc
 
-    subq  $32, %rsp   # Shadow space for WinAPI calls
+    # StretchDIBits(hdc, 0, 0, 64*SCALE, 32*SCALE, 0, 0, 64, 32, bits, bmi, 0, SRCCOPY)
+    movl  $0, %edx                   # Arg 2: xDest
+    movl  $0, %r8d                   # Arg 3: yDest
+    movl  $(64*SCALE), %r9d          # Arg 4: DestWidth
 
-    movq  %rdx, %rbx  # RBX = HDC
-
+    movl  $(32*SCALE),   32(%rsp)    # Arg 5: DestHeight
+    movl  $0,            40(%rsp)    # Arg 6: xSrc
+    movl  $0,            48(%rsp)    # Arg 7: ySrc
+    movl  $64,           56(%rsp)    # Arg 8: SrcWidth
+    movl  $32,           64(%rsp)    # Arg 9: SrcHeight
+    
     leaq  chip8_state(%rip), %rax
-    leaq  OFF_GFX(%rax), %rsi        # RSI = &gfx[0]
+    addq  $OFF_GFX, %rax
+    movq  %rax,          72(%rsp)    # Arg 10: lpBits (Source buffer)
+    
+    leaq  chip8_bmi(%rip), %rax
+    movq  %rax,          80(%rsp)    # Arg 11: lpbmi
+    
+    movl  $0,            88(%rsp)    # Arg 12: iUsage (DIB_RGB_COLORS)
+    movl  $0x00CC0020,   96(%rsp)    # Arg 13: dwRop (SRCCOPY)
 
-    xorl  %r12d, %r12d               # y = 0
-.Ly_loop:
-    cmpl  $32, %r12d
-    jge   .Lrender_done
-
-    xorl  %r13d, %r13d               # x = 0
-.Lx_loop:
-    cmpl  $64, %r13d
-    jge   .Lnext_row
-
-    # index = y * 64 + x
-    movl  %r12d, %eax
-    shll  $6, %eax
-    addl  %r13d, %eax
-    movslq %eax, %rax
-
-    movzbl (%rsi,%rax,1), %r9d       # R9D = pixel (0 or 1)
-    testl %r9d, %r9d
-    jz    .Lskip_pixel               # If 0, nothing is drawn
-
-    # Fill rect for ON pixel
-    movl  %r13d, %ecx
-    imull $SCALE, %ecx
-    movl  %ecx, rect_buf+0(%rip)     # left
-
-    movl  %r12d, %edx
-    imull $SCALE, %edx
-    movl  %edx, rect_buf+4(%rip)     # top
-
-    addl  $SCALE, %ecx
-    movl  %ecx, rect_buf+8(%rip)     # right
-
-    addl  $SCALE, %edx
-    movl  %edx, rect_buf+12(%rip)    # bottom
-
-    # FillRect(hdc, &rect, hBrushOn)
-    movq  %rbx, %rcx
-    leaq  rect_buf(%rip), %rdx
-    movq  hBrushOn(%rip), %r8
-    call  FillRect
-
-.Lskip_pixel:
-    incl  %r13d
-    jmp   .Lx_loop
-
-.Lnext_row:
-    incl  %r12d
-    jmp   .Ly_loop
-
-.Lrender_done:
-    addq  $32, %rsp
+    call  StretchDIBits
 
     # Clear DIRTY flag now that the screen has been painted
     leaq  chip8_state(%rip), %rax
     movb  $0, OFF_DIRTY(%rax)
 
-    popq  %r14
-    popq  %r13
-    popq  %r12
-    popq  %rdi
-    popq  %rsi
-    popq  %rbx
+    addq  $128, %rsp
     popq  %rbp
     ret
 
@@ -1513,10 +1428,11 @@ load_rom:
 
     # Open failed: print error and return
     leaq  fmt_openfail(%rip), %rcx
-    subq  $40, %rsp
+    subq  $56, %rsp                      # 32 (shadow) + 24 (alignment)
+    movq  %rcx, 0(%rsp)
     xorl  %eax, %eax
     call  printf
-    addq  $40, %rsp
+    addq  $56, %rsp
     jmp   .Lrom_done
 
 .Lcf_ok:
@@ -1549,11 +1465,15 @@ load_rom:
     movzbl 2(%rax), %r9d
     movzbl 3(%rax), %eax
 
-    subq  $40, %rsp
-    movq  %rax, 32(%rsp)
+    subq  $56, %rsp                      # 32+24 alignment
+    movq  %rax, 32(%rsp)                 # arg 5
+    movq  %rcx, 0(%rsp)                  # spill
+    movq  %rdx, 8(%rsp)                  # spill
+    movq  %r8,  16(%rsp)                 # spill
+    movq  %r9,  24(%rsp)                 # spill
     xorl  %eax, %eax
     call  printf
-    addq  $40, %rsp
+    addq  $56, %rsp
 
 .Lrom_done:
     popq  %rbx
@@ -1663,14 +1583,20 @@ map_key:
 #   - WM_DESTROY -> kills timer and posts WM_QUIT
 # ============================================================================  
 WndProc:
+    .seh_proc WndProc
     pushq %rbp
+    .seh_pushreg %rbp
     movq  %rsp, %rbp
+    .seh_setframe %rbp, 0
     subq  $64, %rsp          # 32-byte home space + locals + padding
+    .seh_stackalloc 64
+    .seh_endprologue
 
     # Save non-volatile registers above home space
     movq  %rdi, -8(%rbp)
     movq  %rsi, -16(%rbp)
     movq  %rbx, -24(%rbp)
+    movq  %r12, -32(%rbp)
 
     # Copy parameters into callee-saved registers
     movq  %rcx, %rdi         # RDI = hWnd
@@ -1688,6 +1614,8 @@ WndProc:
     je    WndProc_do_keydown
     cmpl  $WM_KEYUP, %esi
     je    WndProc_do_keyup
+    cmpl  $MM_WOM_DONE, %esi
+    je    WndProc_do_wom_done
     jmp   WndProc_defproc
 
 WndProc_do_paint:
@@ -1707,8 +1635,8 @@ WndProc_do_paint:
     jmp   WndProc_ret
 
 WndProc_do_destroy:
-    # CHIP-8 sound may be playing, so force stop it first
-    call  chip8_stop_beep
+    # CHIP-8 sound streaming cleanup
+    call  chip8_audio_cleanup
 
     # Kill the timer
     movq  hWndMain(%rip), %rcx
@@ -1723,30 +1651,110 @@ WndProc_do_destroy:
     jmp   WndProc_ret
 
 WndProc_do_timer:
-    # On each timer tick:
-    #   - Execute a small number of chip8_step()
-    #   - Tick timers (delay/sound)
-    #   - If framebuffer is dirty, invalidate window for repaint (with erase)
-    movl  $8, %ecx                  # Execute ~8 instructions per tick
-WndProc_timer_loop:
+    # 1) Measure dt_ticks using QPC
+    subq  $48, %rsp                         # Align + shadow
+    leaq  32(%rsp), %rcx
+    call  QueryPerformanceCounter
+    movq  32(%rsp), %rax                     # rax = now
+    addq  $48, %rsp
+
+    movq  chip8_qpc_last(%rip), %rdx
+    movq  %rax, chip8_qpc_last(%rip)
+    subq  %rdx, %rax                         # rax = dt_ticks
+    
+    # 2) Calculate dt_us = dt_ticks * 1_000_000 / freq
+    movq  %rax, %r8
+    movq  $1000000, %rax
+    mulq  %r8                                # rdx:rax = dt_ticks * 1e6
+    movq  chip8_qpc_freq(%rip), %rcx
+    divq  %rcx                               # rax = dt_us
+    
+    # Clamp dt_us at 200ms to avoid runaway
+    cmpq  $200000, %rax
+    jbe   1f
+    movq  $200000, %rax
+1:
+    movq  %rax, %r12                         # r12 = dt_us (preserved)
+
+    # 3) CPU steps: cpu_accum += dt_us * IPS
+    movl  chip8_target_ips(%rip), %eax
+    mulq  %r12                               # rdx:rax = dt_us * IPS
+    addq  chip8_cpu_accum(%rip), %rax
+    movq  $1000000, %rcx
+    xorq  %rdx, %rdx
+    divq  %rcx                               # rax = steps, rdx = new accum
+    movq  %rdx, chip8_cpu_accum(%rip)
+    
+    # Clamp steps
+    movl  chip8_max_steps_per_tick(%rip), %edx
+    cmpq  %rdx, %rax
+    jbe   2f
+    movq  %rdx, %rax
+2:
+    movq  %rax, %rbx                         # rbx = steps counter (preserved)
+
+.Lcpu_loop:
+    testq %rbx, %rbx
+    jz    .Lcpu_done
     call  chip8_step
-    decl  %ecx
-    jnz   WndProc_timer_loop
+    decq  %rbx
+    jmp   .Lcpu_loop
+.Lcpu_done:
 
+    # 4) Timers (60Hz): timer_accum += dt_us * 60
+    movq  %r12, %rax
+    movq  $60, %rdx
+    mulq  %rdx
+    addq  chip8_timer_accum(%rip), %rax
+    movq  $1000000, %rcx
+    xorq  %rdx, %rdx
+    divq  %rcx                               # rax = ticks, rdx = new accum
+    movq  %rdx, chip8_timer_accum(%rip)
+    
+    movq  %rax, %rbx                         # rbx = ticks counter
+.Ltimer_loop:
+    testq %rbx, %rbx
+    jz    .Ltimer_done
     call  chip8_tick_timers
+    decq  %rbx
+    jmp   .Ltimer_loop
+.Ltimer_done:
 
+    # 5) Invalidate if dirty
     leaq  chip8_state(%rip), %rax
     movzbl OFF_DIRTY(%rax), %edx
     testl %edx, %edx
     jz    .WndProc_timer_no_redraw
 
-    # InvalidateRect(hWndMain, NULL, TRUE)
     movq  hWndMain(%rip), %rcx
-    xorl  %edx, %edx                # lpRect = NULL (entire client area)
-    movl  $1, %r8d                  # bErase = TRUE
+    xorl  %edx, %edx                         # NULL = entire client area
+    movl  $0, %r8d                           # bErase = FALSE (flicker-free DIB)
     call  InvalidateRect
 
 .WndProc_timer_no_redraw:
+    xorl  %eax, %eax
+    jmp   WndProc_ret
+
+WndProc_do_wom_done:
+    # RCX = hWaveOut, RDX = msg, R10 = wParam, R11 = lpWaveHdr
+    movq  %r11, %rax                         # lpWaveHdr
+    testq %rax, %rax
+    jz    WndProc_ret
+    
+    # Save WAVEHDR* in shadow space (home area) for later
+    movq  %rax, 32(%rsp)
+
+    # 1) Refill PCM buffer associated with this header
+    movq  0(%rax), %rcx                      # lpData
+    movl  8(%rax), %edx                      # dwBufferLength (samples)
+    call  chip8_audio_fill_buf
+
+    # 2) Re-queue it
+    movq  chip8_hWaveOut(%rip), %rcx
+    movq  32(%rsp), %rdx                     # restore WAVEHDR*
+    movl  $48, %r8d                          # sizeof(WAVEHDR)
+    call  waveOutWrite
+    
     xorl  %eax, %eax
     jmp   WndProc_ret
 
@@ -1790,6 +1798,7 @@ WndProc_defproc:
 
 WndProc_ret:
     # Restore non-volatile registers and epilogue
+    movq  -32(%rbp), %r12
     movq  -24(%rbp), %rbx
     movq  -16(%rbp), %rsi
     movq  -8(%rbp),  %rdi
@@ -1797,65 +1806,179 @@ WndProc_ret:
     addq  $64, %rsp
     popq  %rbp
     ret
+    .seh_endproc
 
 
 # ============================================================================  
-# Sound helpers (no separate thread)
-#
-# chip8_start_beep:
-# - If OFF_SOUND > 0 and no sound is playing,
-#   just start PlaySoundA on the pre-rendered CDP1802 beep WAV.
-#
-# chip8_stop_beep:
-# - If currently playing, stop it with PlaySoundA(NULL, NULL, 0).
-#
-# Only called from chip8_tick_timers() and WndProc_do_destroy().
-# chip8_sound_on_flag tracks "already playing" state.
+# Audio (waveOut) helpers
 # ============================================================================  
-chip8_start_beep:
+
+chip8_audio_init:
     pushq %rbp
     movq  %rsp, %rbp
-    subq  $32, %rsp                 # shadow space for PlaySoundA
+    pushq %rbx
+    subq  $40, %rsp                 # Align + Shadow
 
-    # If already playing, do nothing
-    movzbl chip8_sound_on_flag(%rip), %eax
-    testb %al, %al
-    jnz   .Lcsb_done
+    movq  %rcx, %rbx                # rbx = hWnd
 
-    movb  $1, chip8_sound_on_flag(%rip)
+    # 0) CDP1802 core initialization for audio simulation
+    # We need to run the SEQ ROM (setting Q=1) to generate the tone.
+    call  cdp1802_init
+    leaq  cdp1802_beep_rom(%rip), %rcx
+    xorl  %edx, %edx                 # addr = 0
+    leaq  cdp1802_beep_rom_end(%rip) , %r8
+    leaq  cdp1802_beep_rom(%rip), %rax
+    subq  %rax, %r8                      # r8 = len
+    call  cdp1802_load
 
-    # PlaySoundA(chip8_beep_wav, NULL,
-    #            SND_ASYNC | SND_MEMORY | SND_NODEFAULT | SND_LOOP);
-    leaq  chip8_beep_wav(%rip), %rcx   # pszSound (memory)
-    xorl  %edx, %edx                   # hmod = NULL
-    movl  $(SND_ASYNC|SND_MEMORY|SND_NODEFAULT|SND_LOOP), %r8d
-    call  PlaySoundA
+    # 1) Open waveOut device
+    leaq  chip8_hWaveOut(%rip), %rcx
+    movl  $WAVE_MAPPER, %edx
+    leaq  chip8_wfx(%rip), %r8
+    movq  %rbx, %r9                 # callback = hWnd
+    
+    subq  $16, %rsp                 # Extra stack args (5th and 6th)
+    movq  $0, 32(%rsp)              # dwInstance = 0 (offset 32 relative to rsp at call)
+    movl  $CALLBACK_WINDOW, 40(%rsp)# fdwOpen (offset 40)
+    call  waveOutOpen
+    addq  $16, %rsp
+    testl %eax, %eax
+    jnz   .Linit_fail
 
-.Lcsb_done:
+    # 2) Prepare headers and queue them
+    leaq  chip8_hdr0(%rip), %rbx
+    leaq  chip8_audio_buf0(%rip), %rax
+    movq  %rax, 0(%rbx)             # lpData
+    movl  $AUDIO_BUF_SAMPLES, 8(%rbx) # dwBufferLength
+    movq  chip8_hWaveOut(%rip), %rcx
+    movq  %rbx, %rdx
+    movl  $48, %r8d
+    call  waveOutPrepareHeader
+
+    leaq  chip8_hdr1(%rip), %rbx
+    leaq  chip8_audio_buf1(%rip), %rax
+    movq  %rax, 0(%rbx)
+    movl  $AUDIO_BUF_SAMPLES, 8(%rbx)
+    movq  chip8_hWaveOut(%rip), %rcx
+    movq  %rbx, %rdx
+    movl  $48, %r8d
+    call  waveOutPrepareHeader
+
+    leaq  chip8_hdr2(%rip), %rbx
+    leaq  chip8_audio_buf2(%rip), %rax
+    movq  %rax, 0(%rbx)
+    movl  $AUDIO_BUF_SAMPLES, 8(%rbx)
+    movq  chip8_hWaveOut(%rip), %rcx
+    movq  %rbx, %rdx
+    movl  $48, %r8d
+    call  waveOutPrepareHeader
+
+    # 3) Initial full buffers and write
+    leaq  chip8_audio_buf0(%rip), %rcx
+    movl  $AUDIO_BUF_SAMPLES, %edx
+    call  chip8_audio_fill_buf
+    movq  chip8_hWaveOut(%rip), %rcx
+    leaq  chip8_hdr0(%rip), %rdx
+    movl  $48, %r8d
+    call  waveOutWrite
+
+    leaq  chip8_audio_buf1(%rip), %rcx
+    movl  $AUDIO_BUF_SAMPLES, %edx
+    call  chip8_audio_fill_buf
+    movq  chip8_hWaveOut(%rip), %rcx
+    leaq  chip8_hdr1(%rip), %rdx
+    movl  $48, %r8d
+    call  waveOutWrite
+
+    leaq  chip8_audio_buf2(%rip), %rcx
+    movl  $AUDIO_BUF_SAMPLES, %edx
+    call  chip8_audio_fill_buf
+    movq  chip8_hWaveOut(%rip), %rcx
+    leaq  chip8_hdr2(%rip), %rdx
+    movl  $48, %r8d
+    call  waveOutWrite
+
+.Linit_fail:
+
+    addq  $40, %rsp
+    popq  %rbx
+    popq  %rbp
+    ret
+
+chip8_audio_cleanup:
+    pushq %rbp
+    movq  %rsp, %rbp
+    subq  $32, %rsp
+    
+    movq  chip8_hWaveOut(%rip), %rcx
+    testq %rcx, %rcx
+    jz    .Lac_done
+    
+    call  waveOutReset
+    
+    movq  chip8_hWaveOut(%rip), %rcx
+    leaq  chip8_hdr0(%rip), %rdx
+    movl  $48, %r8d
+    call  waveOutUnprepareHeader
+    movq  chip8_hWaveOut(%rip), %rcx
+    leaq  chip8_hdr1(%rip), %rdx
+    movl  $48, %r8d
+    call  waveOutUnprepareHeader
+    movq  chip8_hWaveOut(%rip), %rcx
+    leaq  chip8_hdr2(%rip), %rdx
+    movl  $48, %r8d
+    call  waveOutUnprepareHeader
+    
+    movq  chip8_hWaveOut(%rip), %rcx
+    call  waveOutClose
+    movq  $0, chip8_hWaveOut(%rip)
+
+.Lac_done:
     addq  $32, %rsp
     popq  %rbp
     ret
 
-chip8_stop_beep:
+# chip8_audio_fill_buf(void* buf, int samples)
+chip8_audio_fill_buf:
     pushq %rbp
     movq  %rsp, %rbp
-    subq  $32, %rsp                   # shadow space for PlaySoundA
-
-    # If it's already off, do nothing
-    movzbl chip8_sound_on_flag(%rip), %eax
-    testb %al, %al
-    jz    .Lctb_done
-
-    movb  $0, chip8_sound_on_flag(%rip)
-
-    # PlaySoundA(NULL, NULL, 0); -> Stops the current sound
-    xorl  %ecx, %ecx
-    xorl  %edx, %edx
-    xorl  %r8d, %r8d
-    call  PlaySoundA
-
-.Lctb_done:
+    pushq %rbx
+    pushq %r12
+    subq  $32, %rsp                 # Shadow(32) + 0 alignment fix (24 + 32 + 8 = 64 = 16-aligned)
+    
+    movq  %rcx, %rbx                # rbx = ptr
+    movl  %edx, %r12d               # r12d = count (standard Win64 EDX)
+    
+.Lfill_loop:
+    testl %r12d, %r12d
+    jz    .Lfill_done
+    
+    # Get raw sample from 1802 (steps=1)
+    movl  $1, %ecx
+    call  cdp1802_audio_sample       # AL = 0..255 (centered at 128)
+    
+    # 8-bit Volume Scaling: out = 128 + ((sample - 128) * volume) / 255
+    movzbl %al, %eax
+    subl  $128, %eax                # eax = s - 128 (relative to center)
+    
+    movzbl chip8_audio_volume(%rip), %ecx
+    imull %ecx, %eax                # eax *= volume
+    
+    cltd                            # Sign extend EAX -> EDX:EAX
+    movl  $255, %ecx
+    idivl %ecx                      # eax = result
+    
+    addl  $128, %eax                # Shift back
+    movb  %al, (%rbx)
+    
+    incq  %rbx
+    decl  %r12d
+    jmp   .Lfill_loop
+    
+.Lfill_done:
     addq  $32, %rsp
+    popq  %r12
+    popq  %rbx
     popq  %rbp
     ret
 
@@ -1887,8 +2010,11 @@ main:
     cmpl  $2, %r8d
     jge   .Lm_have_arg
     leaq  fmt_usage(%rip), %rcx
+    subq  $48, %rsp                      # 32 (shadow) + 16 (alignment)
+    movq  %rcx, 0(%rsp)
     xorl  %eax, %eax
     call  printf
+    addq  $48, %rsp
     movl  $1, %eax
     jmp   .Lm_exit
 
@@ -1901,8 +2027,12 @@ main:
     # Print "Loaded ROM: %s\n"
     leaq  fmt_loaded(%rip), %rcx
     movq  rom_filename(%rip), %rdx
+    subq  $48, %rsp                      # 32+16
+    movq  %rcx, 0(%rsp)
+    movq  %rdx, 8(%rsp)
     xorl  %eax, %eax
     call  printf
+    addq  $48, %rsp
 
     # Initialize CHIP-8 state (also builds CDP1802-based beep PCM)
     call  chip8_init
@@ -1913,8 +2043,11 @@ main:
 
     # Debug: print "After init+load"
     leaq  fmt_after_init(%rip), %rcx
+    subq  $48, %rsp
+    movq  %rcx, 0(%rsp)
     xorl  %eax, %eax
     call  printf
+    addq  $48, %rsp
 
     # hInstance = GetModuleHandleA(NULL)
     xorl  %ecx, %ecx
@@ -1929,6 +2062,14 @@ main:
     movl  $WHITE_RGB, %ecx
     call  CreateSolidBrush
     movq  %rax, hBrushOn(%rip)
+
+    # Initialize timing (QPF/QPC)
+    subq  $32, %rsp
+    leaq  chip8_qpc_freq(%rip), %rcx
+    call  QueryPerformanceFrequency
+    leaq  chip8_qpc_last(%rip), %rcx
+    call  QueryPerformanceCounter
+    addq  $32, %rsp
 
     # ------------------------------------------------------------------------
     # Register window class (WNDCLASSEX)
@@ -1957,8 +2098,12 @@ main:
     # Debug: print RegisterClassExA return value
     leaq  fmt_regcls(%rip), %rcx
     movl  %eax, %edx
+    subq  $48, %rsp
+    movq  %rcx, 0(%rsp)
+    movq  %rdx, 8(%rsp)
     xorl  %eax, %eax
     call  printf
+    addq  $48, %rsp
 
     # ------------------------------------------------------------------------
     # Create main window with client area roughly matching 64x32 * SCALE
@@ -1984,11 +2129,19 @@ main:
 
     movq  %rax, hWndMain(%rip)
 
+    # Initialize audio system (waveOut streaming)
+    movq  %rax, %rcx                 # hWnd
+    call  chip8_audio_init
+
     # Debug: print hWndMain
     leaq  fmt_hwnd(%rip), %rcx
     movq  hWndMain(%rip), %rdx
+    subq  $48, %rsp
+    movq  %rcx, 0(%rsp)
+    movq  %rdx, 8(%rsp)
     xorl  %eax, %eax
     call  printf
+    addq  $48, %rsp
 
     # ShowWindow / UpdateWindow
     movq  hWndMain(%rip), %rcx

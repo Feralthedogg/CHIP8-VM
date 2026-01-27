@@ -13,34 +13,26 @@
     #   unsigned char cdp1802_audio_sample(unsigned int steps_per_sample);
     #
     # Audio model (VIP base hardware style):
-    #   - Q bit gates a fixed-frequency square-wave tone (CA555 timer)
-    #       Q = 1 -> tone on
-    #       Q = 0 -> silence
-    #   - Phase accumulator oscillator for the fixed tone
-    #   - Asymmetric duty cycle (≈ 2/3 ≈ 66.7%) to mimic 555 astable behaviour
-    #   - Q rising edge (0->1) resets phase (555 retrigger-style)
-    #   - 2-stage 1st-order low-pass filter ≈ speaker/RC response
-    #   - Very-slow DC offset tracker (crude AC coupling / bias drift)
-    #   - Returns unsigned 8-bit PCM sample 0..255 (128 ≈ "silence")
+    #   - Q bit gates a fixed-frequency phase-accumulator oscillator (CA555 style)
+    #   - Asymmetric duty cycle (≈ 2/3 ≈ 66.7%) for VIP-accurate 555 tone
+    #   - Dynamic AC Coupling: out = (raw_osc - dc_tracker) + 128
+    #   - Centers waveform at 128 regardless of duty cycle, avoids gating pops
+    #   - Light 1-stage 1st-order Low-Pass Filter (LPF) smooths square edges
+    #   - Very-slow DC offset tracker (analog-style AC coupling simulation)
+    #   - Returns unsigned 8-bit PCM sample 0..255 (128 = silence/center)
     #
     # NOTE:
-    #   - cdp1802_tone_step is initialized from the *actual* COSMAC VIP
-    #     555 astable RC network:
-    #         R1 = 100 kΩ, R2 = 100 kΩ, C = 0.0047 µF
-    #     giving:
-    #         f_555 ≈ 1.44 / ((R1 + 2*R2) * C) ≈ 1021 Hz
-    #     and for a 44.1 kHz sample rate:
-    #         step = 2^32 * f_555 / sample_rate ≈ 0x05EDB21D
+    #   - cdp1802_tone_step controls the frequency of the square-wave oscillator.
+    #   - cdp1802_audio_sample's steps_per_sample controls how many instruction
+    #     steps are executed before returning a single audio sample (gating rate).
+    #   - cdp1802_beep_rom is a simple SEQ loop (constant Q=1).
     #
-    #     If you change the RC values or the audio sample rate, recompute:
+    #   Actual COSMAC VIP 555 astable RC network:
+    #       R1 = 100 kΩ, R2 = 100 kΩ, C = 0.0047 µF
+    #       f_555 ≈ 1.44 / ((R1 + 2*R2) * C) ≈ 1021 Hz
     #
-    #         // 555 astable:
-    #         //   f = 1.44 / ((R1 + 2*R2) * C)
-    #         // then:
-    #         //   step = 2^32 * f / sample_rate;
-    #
-    #   - cdp1802_mcycles keeps a running count of CDP1802 machine cycles
-    #     (most instructions = 2 cycles, long branches = 3 cycles).
+    #   For a specific sample_rate:
+    #       step = 2^32 * f_555 / sample_rate
     # =========================================================================
 
     .section .bss
@@ -68,14 +60,10 @@ cdp1802_mem:
     .space 65536                     # 64 KB memory
 
     # Audio state --------------------------------------------------------------
-    # 2-stage 1st-order low-pass filter state (moves around ~128)
+    # 1-stage 1st-order low-pass filter state (moves around ~128)
     .globl cdp1802_lp_state
 cdp1802_lp_state:
-    .space 4                         # int, stage 1 LPF
-
-    .globl cdp1802_lp_state2
-cdp1802_lp_state2:
-    .space 4                         # int, stage 2 LPF
+    .space 4                         # int, LPF depth
 
     # DC offset tracker (for very slow bias drift / AC coupling)
     .globl cdp1802_dc_offset
@@ -104,7 +92,12 @@ cdp1802_mcycles:
     # Previous Q state (for rising edge detection)
     .globl cdp1802_q_prev
 cdp1802_q_prev:
-    .space 1                         # 0/1, last Q value seen by audio
+    .space 1                         # 0/1, last effective_q value seen by audio
+
+    # Audio Gate (for low-latency start/stop by the host)
+    .globl cdp1802_gate
+cdp1802_gate:
+    .space 1                         # 0/1 (1 = allowed to sound, 0 = force silence)
 
     # Optional: CDP1863-style tone frequency register (OUT 3)
     # (not yet used by the interpreter; reserved for expansion)
@@ -118,23 +111,18 @@ cdp1802_tone_frequency_reg:
     .align 4
 
     # -------------------------------------------------------------------------
-    # Test beep ROM
+    # cdp1802_beep_rom
     #
-    # 0000: 7A          ; REQ        -> Q = 0
-    # 0001: C0 00 04    ; LBR 0004   -> jump to 0004
-    # 0004: 7B          ; SEQ        -> Q = 1
-    # 0005: C0 00 00    ; LBR 0000   -> jump to 0000
-    #
-    # Q = 0,1,0,1,... repeats -> for this VIP-style audio model, this will
-    # modulate the gated tone (tone only present when Q=1).
+    # Simple loop that sets Q=1 (SEQ) and loops (LBR 0000).
+    # This keeps the oscillator gated ON for the duration of the audio sample.
     # -------------------------------------------------------------------------
     .globl cdp1802_beep_rom
+    .globl cdp1802_beep_rom_end
 cdp1802_beep_rom:
-    .byte 0x7A              # 0000: REQ
-    .byte 0xC0,0x00,0x04    # 0001: LBR 0004
-    .byte 0x7B              # 0004: SEQ
-    .byte 0xC0,0x00,0x00    # 0005: LBR 0000
-    .equ CDP1802_BEEP_ROM_SIZE, . - cdp1802_beep_rom
+    .byte 0x7B              # 0000: SEQ (Q=1 gated high)
+    .byte 0xC0,0x00,0x00    # 0001: LBR 0000 (loop)
+cdp1802_beep_rom_end:
+    .equ CDP1802_BEEP_ROM_SIZE, cdp1802_beep_rom_end - cdp1802_beep_rom  # internal constant
 
 
     .section .text
@@ -186,8 +174,7 @@ cdp1802_init:
 
     # Initialize audio state
     # LPF center around 128 (silence level for unsigned PCM)
-    movl  $128, cdp1802_lp_state(%rip)   # stage 1
-    movl  $128, cdp1802_lp_state2(%rip)  # stage 2
+    movl  $128, cdp1802_lp_state(%rip)
 
     # DC offset starts at mid-level
     movl  $128, cdp1802_dc_offset(%rip)
@@ -195,12 +182,15 @@ cdp1802_init:
     # Tone oscillator
     movl  $0, cdp1802_tone_phase(%rip)
 
-    # Default tone_step: ≈1.02 kHz (≈1.0 kHz) at 44.1 kHz sample rate
+    # Audio gate defaults to 0 (off)
+    movb  $0, cdp1802_gate(%rip)
+
+    # Default tone_step: ≈1.02 kHz (≈1.0 kHz) at 8 kHz sample rate
     #   Using actual COSMAC VIP values:
     #       R1 = 100 kΩ, R2 = 100 kΩ, C = 0.0047 µF
     #       f_555 ≈ 1.44 / ((R1 + 2*R2) * C) ≈ 1021 Hz
-    #       step ≈ 2^32 * 1021 / 44100 ≈ 0x05EDB21D
-    movl  $0x05EDB21D, cdp1802_tone_step(%rip)
+    #       step ≈ 2^32 * 1021 / 8000 ≈ 0x20AC0831
+    movl  $0x20AC0831, cdp1802_tone_step(%rip)
 
     # RNG seed
     movl  $1, cdp1802_rng_state(%rip)
@@ -483,39 +473,51 @@ cdp1802_step:
 # 1) Run 1802 for steps_per_sample instruction steps
 # 2) Detect Q rising edge (0->1) and reset tone phase on that edge
 # 3) Read Q pin; if Q==1, generate a fixed-frequency square-wave tone
-#    using a phase accumulator (555-style oscillator) with ≈2/3 duty.
-#    If Q==0, use a slowly adapting DC offset (simulated AC coupling).
-# 4) Apply 2-stage 1st-order low-pass filter: y += (x - y) >> 3 twice
-# 5) Clamp to 0..255, slowly adapt DC offset, and return AL/EAX
+# 3) Q gates a fixed-frequency tone (CA555-style) with 2/3 duty cycle.
+# 4) Audio Stage: Dynamic AC Coupling & Light LPF
+#    - out = (raw - dc_offset) + 128
+#    - dc_offset tracks slowly (>>10 weight)
+#    - lpf smoothens (>>5 weight)
+# 5) Clamp to 0..255 and return sample in AL/EAX
 # -----------------------------------------------------------------------------
 cdp1802_audio_sample:
     pushq %rbp
     movq  %rsp, %rbp
-
     pushq %rbx
     pushq %rsi
     pushq %rdi
+
+    # Win64 ABI: allocate 32B shadow space + 8B alignment
+    # Entry: 8 mod 16. Pushes: 4 * 8 = 32. Total shift = 40 mod 16 -> 8 mod 16.
+    # subq $40 ensures CALL-time RSP is 16-aligned.
+    subq  $40, %rsp
 
     # 1) Run 1802 for the requested number of instruction steps
     #    RCX = steps_per_sample as-is
     call  cdp1802_step
 
-    # 2) Q rising edge detection for phase reset
+    addq  $40, %rsp
+
+    # 2) Q and Gate combining for effective_q
     movzbl cdp1802_state+OFF_Q(%rip), %eax   # EAX = current Q (0/1)
-    movzbl cdp1802_q_prev(%rip), %edx        # EDX = previous Q
+    movzbl cdp1802_gate(%rip), %ecx          # ECX = gate (0/1)
+    andl   %ecx, %eax                        # EAX = effective_q (0/1)
+
+    # 3) effective_q rising edge detection for phase reset
+    movzbl cdp1802_q_prev(%rip), %edx        # EDX = previous effective_q
 
     testl %edx, %edx
     jnz   .Lq_not_rising_candidate           # prev != 0 -> no 0->1
     testl %eax, %eax
     jz    .Lq_not_rising_candidate           # curr == 0 -> still 0
 
-    # Q: 0 -> 1 rising edge -> reset 555 phase
+    # Q & Gate: 0 -> 1 rising edge -> reset 555 phase
     movl  $0, cdp1802_tone_phase(%rip)
 
 .Lq_not_rising_candidate:
-    movb  %al, cdp1802_q_prev(%rip)          # store current Q as previous
+    movb  %al, cdp1802_q_prev(%rip)          # store current effective_q as previous
 
-    # 3) Q gates a fixed-frequency tone (CA555-style)
+    # 4) effective_q gates a fixed-frequency tone (CA555-style)
     testl %eax, %eax
     jz    .Laudio_q_zero
 
@@ -543,51 +545,45 @@ cdp1802_audio_sample:
     jmp   .Lraw_ready
 
 .Laudio_q_zero:
-    # Q == 0 -> silence around slowly adapting DC offset
+    # Q == 0 -> silence. Use current DC offset as input to keep AC output at 128.
     movl  cdp1802_dc_offset(%rip), %ebx
 
 .Lraw_ready:
-    # 4) 2-stage 1st-order low-pass filter: y += (x - y) >> 3 twice
-    #
-    # Stage 1
-    movl  cdp1802_lp_state(%rip), %esi   # y1
-    movl  %ebx, %eax                     # x
-    subl  %esi, %eax                     # (x - y1)
-    sarl  $3, %eax                       # >>3 ≈ 1/8
-    addl  %eax, %esi                     # y1 += ...
-    movl  %esi, cdp1802_lp_state(%rip)   # store y1
+    # 4a) Update DC offset slowly (DC tracker)
+    #     dc += (raw - dc) >> 10 (Slower for analog-style AC coupling decay)
+    movl  cdp1802_dc_offset(%rip), %ecx   # ECX = dc
+    movl  %ebx, %edx
+    subl  %ecx, %edx                      # EDX = (raw - dc)
+    sarl  $10, %edx                       # weight = 1/1024
+    addl  %edx, %ecx
+    movl  %ecx, cdp1802_dc_offset(%rip)   # store updated dc
+    
+    # 4b) AC coupling: center around 128
+    #     out = raw - dc + 128
+    subl  %ecx, %ebx                      # EBX = (raw - dc)
+    addl  $128, %ebx                      # EBX = centered sample (int)
 
-    # Stage 2
-    movl  cdp1802_lp_state2(%rip), %edi  # y2
-    movl  %esi, %eax                     # x2 = y1
-    subl  %edi, %eax                     # (x2 - y2)
-    sarl  $3, %eax                       # >>3 ≈ 1/8
-    addl  %eax, %edi                     # y2 += ...
-    movl  %edi, cdp1802_lp_state2(%rip)  # store y2
+    # 4c) Light Low-Pass Filter (1-stage) to smooth the square wave
+    #     lpf += (centered - lpf) >> 5
+    movl  cdp1802_lp_state(%rip), %esi
+    movl  %ebx, %eax
+    subl  %esi, %eax                      # EAX = (centered - lpf)
+    sarl  $5, %eax                        # lighter weighting (>>5)
+    addl  %eax, %esi
+    movl  %esi, cdp1802_lp_state(%rip)
 
-    # 5) Clamp final output to 0..255
-    cmpl  $0, %edi
-    jge   .Llp_nonneg2
-    xorl  %edi, %edi
-    jmp   .Llp_clamped2
-
-.Llp_nonneg2:
-    cmpl  $255, %edi
-    jle   .Llp_clamped2
-    movl  $255, %edi
-
-.Llp_clamped2:
-    # Very-slow DC offset adaptation (crude AC coupling)
-    #
-    # dc += (sample - dc) >> 8
-    movl  cdp1802_dc_offset(%rip), %eax   # eax = dc
-    movl  %edi, %ebx                      # ebx = sample
-    subl  %eax, %ebx                      # (sample - dc)
-    sarl  $8, %ebx                        # very slow (1/256)
-    addl  %ebx, %eax                      # dc += ...
-    movl  %eax, cdp1802_dc_offset(%rip)   # store new dc
-
-    movl  %edi, %eax                      # return sample in EAX (0..255)
+    # 4d) Clamp final output to 0..255 for PCM
+    movl  %esi, %eax                      # EAX = filtered sample
+    cmpl  $255, %eax
+    jle   .Lclamp_under_255
+    movl  $255, %eax
+    jmp   .Lclamp_done
+.Lclamp_under_255:
+    cmpl  $0, %eax
+    jge   .Lclamp_done
+    xorl  %eax, %eax
+.Lclamp_done:
+    # return sample in EAX (0..255)
 
     popq  %rdi
     popq  %rsi
