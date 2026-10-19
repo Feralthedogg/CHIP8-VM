@@ -1,0 +1,7 @@
+*.o
+*.exe
+__pycache__/
+.venv/
+tests/.cache/
+tests/reports/
+.DS_Store
