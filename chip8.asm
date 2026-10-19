@@ -13,10 +13,10 @@
     #   - Core CHIP-8 state and interpreter (classic quirks)
     #   - 64x32 monochrome framebuffer
     #   - Win32 window + paint loop
-    #   - Timer-based CPU stepping at ~60 Hz
+    #   - QPC-based CPU stepping at 700 IPS and independent 60 Hz timers
     #   - Dirty-flag based rendering (only repaint when display changes)
     #   - Fx0A "wait for key" semantics using a non-blocking, event-driven scheme
-    #   - Sound: OFF_SOUND > 0 -> CDP1802-based beep (pre-rendered 1s WAV)
+    #   - Sound timer gates CDP1802-generated PCM streamed through waveOut
     # =========================================================================
 
     .section .bss
@@ -325,7 +325,7 @@ windowTitle:
 #   - Sets PC to 0x200
 #   - Copies built-in font into memory at 0x050
 #   - Seeds the pseudo-RNG
-#   - Builds 1-second CDP1802-based beep PCM into chip8_beep_pcm
+#   - Audio state is initialized separately by chip8_audio_init
 # ----------------------------------------------------------------------------
 chip8_init:
     pushq %rbp
@@ -419,7 +419,7 @@ chip8_tick_timers:
 #   EDX = pressed (0 = released, non-zero = pressed)
 #
 # Writes the key state into OFF_KEYS[key].
-# Also, if Fx0A is waiting for a key (WAITFLAG != 0) and this is a press,
+# Fx0A captures a press, then completes only on that same key's release:
 # it stores the key index into V[WAITREG] and clears WAITFLAG.
 # ----------------------------------------------------------------------------
 chip8_set_key:
@@ -505,10 +505,10 @@ rng_next_byte:
 # Executes exactly one CHIP-8 instruction at the current PC.
 # Implements classic CHIP-8 quirks (8xy6, 8xyE, Bnnn, Fx55, Fx65).
 # Fx0A semantics:
-#   - If a key is already pressed, Vx = key index, then continue.
-#   - If no key is pressed, interpreter enters a "waiting" state:
-#       WAITFLAG = 1, WAITREG = x, and subsequent chip8_step calls do nothing
-#       until a key press event arrives via chip8_set_key.
+#   - If a key is already pressed, wait for that key's release.
+#   - Otherwise wait for a press, then the same key's release.
+#   - Subsequent chip8_step calls do nothing until chip8_set_key completes
+#     the wait, allowing timers and window messages to keep running.
 # ============================================================================  
 chip8_step:
     pushq %rbp
@@ -955,13 +955,12 @@ chip8_step:
 #   Vx = (random_byte() & kk)
 # ----------------------------------------------------------------------------
 .OP_Cxkk:
-    movl  %r13d, %eax
-    movl  %eax, %ecx
+    call  rng_next_byte               # AL = random; volatile registers may change
+    # Decode after the call; R13 preserves the opcode across rng_next_byte.
+    movl  %r13d, %ecx
+    movl  %ecx, %edx                  # DL = kk
     shrl  $8, %ecx
     andl  $0x0F, %ecx                  # ECX = x
-    andl  $0x00FF, %eax                # EAX = kk
-    movl  %eax, %edx
-    call  rng_next_byte               # AL = random
     andb  %dl, %al
     movb  %al, OFF_V(%rbx,%rcx,1)
     jmp   .STEP_END
@@ -1255,9 +1254,14 @@ chip8_step:
     movzbl %cl, %r9d                  # R9B = tens digit
     movl  %eax, %r10d                 # R10B = ones digit
 
-    movb  %r8b,  (%rsi,%rdx,1)
-    movb  %r9b, 1(%rsi,%rdx,1)
-    movb  %r10b,2(%rsi,%rdx,1)
+    # Normalize each destination so BCD never spills into V0/V1 at 0x1000.
+    movb  %r8b, (%rsi,%rdx,1)
+    incl  %edx
+    andl  $0x0FFF, %edx
+    movb  %r9b, (%rsi,%rdx,1)
+    incl  %edx
+    andl  $0x0FFF, %edx
+    movb  %r10b,(%rsi,%rdx,1)
     jmp   .STEP_END
 
 .OP_Fx55:                   # LD [I], V0..Vx (classic: I = I + X + 1)
@@ -1344,11 +1348,9 @@ chip8_step:
 # RCX = hWnd (unused here, but passed for API consistency)
 # RDX = hdc  (device context to render into)
 #
-# Renders the 64x32 CHIP-8 framebuffer (OFF_GFX) as a scaled rectangle grid
-# using FillRect and the "pixel on" brush only.
-#   - Background is cleared using the window class background brush (black).
-#   - Only pixels with value 1 are drawn.
-#   - After drawing, the DIRTY flag is cleared to 0.
+# Scales the entire 64x32 framebuffer (OFF_GFX) with one StretchDIBits call.
+# The top-down 8-bit DIB palette maps 0 to black and 1 to white, so off pixels
+# are painted too. After drawing, the DIRTY flag is cleared to 0.
 # ============================================================================  
 chip8_render_window:
     pushq %rbp
@@ -1741,17 +1743,17 @@ WndProc_do_wom_done:
     testq %rax, %rax
     jz    WndProc_ret
     
-    # Save WAVEHDR* in shadow space (home area) for later
-    movq  %rax, 32(%rsp)
+    # Keep WAVEHDR* in the already-saved R12. 32(%rsp) holds the caller's R12.
+    movq  %rax, %r12
 
     # 1) Refill PCM buffer associated with this header
-    movq  0(%rax), %rcx                      # lpData
-    movl  8(%rax), %edx                      # dwBufferLength (samples)
+    movq  0(%r12), %rcx                      # lpData
+    movl  8(%r12), %edx                      # dwBufferLength (samples)
     call  chip8_audio_fill_buf
 
     # 2) Re-queue it
     movq  chip8_hWaveOut(%rip), %rcx
-    movq  32(%rsp), %rdx                     # restore WAVEHDR*
+    movq  %r12, %rdx                         # preserved WAVEHDR*
     movl  $48, %r8d                          # sizeof(WAVEHDR)
     call  waveOutWrite
     
@@ -2034,7 +2036,7 @@ main:
     call  printf
     addq  $48, %rsp
 
-    # Initialize CHIP-8 state (also builds CDP1802-based beep PCM)
+    # Initialize CHIP-8 state; audio is initialized after window creation
     call  chip8_init
 
     # Load ROM into memory
